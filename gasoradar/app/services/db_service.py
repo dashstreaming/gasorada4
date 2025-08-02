@@ -1,15 +1,15 @@
 """
-Servicio de base de datos - OPTIMIZADO para velocidad
+Servicio de base de datos - Operaciones CRUD básicas (CORREGIDO)
 """
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from statistics import mean
 
-from sqlalchemy import select, and_, or_, func, desc, text
+from sqlalchemy import select, and_, or_, func, desc
 from sqlalchemy.orm import selectinload
 
-from ..database import async_session
+from ..database import async_session  # Cambiado: usar async_session directamente
 from ..models.gas_station import GasStation
 from ..models.gas_price import GasPrice
 from ..models.user_report import UserPriceReport
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseService:
-    """Servicio optimizado para operaciones de base de datos"""
+    """Servicio para operaciones comunes de base de datos"""
     
     async def get_gas_stations(self, 
                               latitude: Optional[float] = None,
@@ -31,346 +31,171 @@ class DatabaseService:
                               brand: Optional[str] = None,
                               fuel_type: Optional[str] = None,
                               limit: int = 50,
-                              offset: int = 0) -> List[Dict]:
+                              offset: int = 0) -> List[GasStation]:
         """
-        OPTIMIZADA: Obtiene gasolineras usando SQL directo para mayor velocidad
+        Obtiene gasolineras con filtros opcionales
         """
-        async with async_session() as session:
+        async with async_session() as session:  # CORREGIDO: usar async_session() directamente
+            query = select(GasStation).where(GasStation.is_active == True)
             
-            # Query base optimizada con JOIN para obtener precios en una sola consulta
-            base_query = """
-                SELECT DISTINCT
-                    gs.id,
-                    gs.name,
-                    gs.brand,
-                    gs.address,
-                    gs.city,
-                    gs.state,
-                    gs.latitude,
-                    gs.longitude,
-                    gs.has_magna,
-                    gs.has_premium,
-                    gs.has_diesel,
-                    gs.average_rating,
-                    gs.total_reviews
-                FROM gas_stations gs
-                WHERE gs.is_active = true
-            """
-            
-            params = {}
-            conditions = []
-            
-            # Filtro por ubicación (optimizado con bounding box)
+            # Filtros de ubicación
             if latitude and longitude and radius_km:
-                # Usar bounding box en lugar de cálculos complejos de distancia
-                lat_delta = radius_km / 111.0  # ~111 km por grado
-                lng_delta = radius_km / (111.0 * abs(latitude / 90.0))
+                # Aproximación simple de rango por grados
+                lat_range = radius_km / 111.0  # ~111 km por grado de latitud
+                lng_range = radius_km / (111.0 * abs(latitude / 90.0))
                 
-                conditions.append("""
-                    gs.latitude BETWEEN :min_lat AND :max_lat
-                    AND gs.longitude BETWEEN :min_lng AND :max_lng
-                """)
-                params.update({
-                    'min_lat': latitude - lat_delta,
-                    'max_lat': latitude + lat_delta,
-                    'min_lng': longitude - lng_delta,
-                    'max_lng': longitude + lng_delta
-                })
+                query = query.where(
+                    and_(
+                        GasStation.latitude.between(latitude - lat_range, latitude + lat_range),
+                        GasStation.longitude.between(longitude - lng_range, longitude + lng_range)
+                    )
+                )
             
             # Filtros de texto
             if city:
-                conditions.append("gs.city ILIKE :city")
-                params['city'] = f"%{city}%"
-                
+                query = query.where(GasStation.city.ilike(f"%{city}%"))
             if state:
-                conditions.append("gs.state ILIKE :state")
-                params['state'] = f"%{state}%"
-                
+                query = query.where(GasStation.state.ilike(f"%{state}%"))
             if brand:
-                conditions.append("gs.brand ILIKE :brand")
-                params['brand'] = f"%{brand}%"
+                query = query.where(GasStation.brand.ilike(f"%{brand}%"))
             
             # Filtro por tipo de combustible
             if fuel_type:
                 fuel_type = fuel_type.lower()
                 if fuel_type == "magna":
-                    conditions.append("gs.has_magna = true")
+                    query = query.where(GasStation.has_magna == True)
                 elif fuel_type == "premium":
-                    conditions.append("gs.has_premium = true")
+                    query = query.where(GasStation.has_premium == True)
                 elif fuel_type == "diesel":
-                    conditions.append("gs.has_diesel = true")
+                    query = query.where(GasStation.has_diesel == True)
             
-            # Agregar condiciones al query
-            if conditions:
-                base_query += " AND " + " AND ".join(conditions)
-            
-            # Ordenamiento y límite
+            # Ordenamiento por distancia si hay coordenadas
             if latitude and longitude:
-                # Ordenamiento aproximado por distancia
-                base_query += """
-                    ORDER BY (ABS(gs.latitude - :user_lat) + ABS(gs.longitude - :user_lng))
-                """
-                params.update({'user_lat': latitude, 'user_lng': longitude})
+                query = query.order_by(
+                    func.abs(GasStation.latitude - latitude) + 
+                    func.abs(GasStation.longitude - longitude)
+                )
             else:
-                base_query += " ORDER BY gs.name"
+                query = query.order_by(GasStation.name)
             
-            base_query += " LIMIT :limit OFFSET :offset"
-            params.update({'limit': limit, 'offset': offset})
+            # Paginación
+            query = query.offset(offset).limit(limit)
             
-            # Ejecutar query principal
-            result = await session.execute(text(base_query), params)
-            stations_data = result.fetchall()
-            
-            if not stations_data:
-                return []
-            
-            # Obtener IDs de las estaciones
-            station_ids = [str(row[0]) for row in stations_data]
-            
-            # Query optimizada para precios actuales
-            prices_query = """
-                SELECT 
-                    gp.gas_station_id,
-                    gp.fuel_type,
-                    gp.price,
-                    gp.source,
-                    gp.confidence_score,
-                    gp.created_at
-                FROM gas_prices gp
-                WHERE gp.gas_station_id = ANY(:station_ids)
-                AND gp.is_current = true
-                AND gp.validation_status = 'validated'
-                ORDER BY gp.created_at DESC
-            """
-            
-            prices_result = await session.execute(
-                text(prices_query), 
-                {'station_ids': station_ids}
+            result = await session.execute(query)
+            return result.scalars().all()
+    
+    async def get_gas_station_by_id(self, station_id: str) -> Optional[GasStation]:
+        """Obtiene una gasolinera por ID con precios y reseñas"""
+        async with async_session() as session:  # CORREGIDO
+            query = select(GasStation).where(
+                and_(
+                    GasStation.id == station_id,
+                    GasStation.is_active == True
+                )
+            ).options(
+                selectinload(GasStation.prices),
+                selectinload(GasStation.reviews)
             )
             
-            # Organizar precios por estación
-            prices_by_station = {}
-            for price_row in prices_result.fetchall():
-                station_id, fuel_type, price, source, confidence, created_at = price_row
-                
-                if station_id not in prices_by_station:
-                    prices_by_station[station_id] = {}
-                
-                if fuel_type not in prices_by_station[station_id]:
-                    prices_by_station[station_id][fuel_type] = {
-                        'price': float(price),
-                        'source': source,
-                        'confidence': float(confidence),
-                        'updated_at': created_at.isoformat(),
-                        'age_hours': (datetime.utcnow() - created_at).total_seconds() / 3600,
-                        'is_fresh': (datetime.utcnow() - created_at).total_seconds() < 86400
+            result = await session.execute(query)
+            return result.scalar_one_or_none()
+    
+    async def get_current_prices(self, station_id: str) -> Dict[str, Optional[Dict]]:
+        """Obtiene los precios actuales de una gasolinera"""
+        async with async_session() as session:  # CORREGIDO
+            query = select(GasPrice).where(
+                and_(
+                    GasPrice.gas_station_id == station_id,
+                    GasPrice.is_current == True,
+                    GasPrice.validation_status == "validated"
+                )
+            ).order_by(desc(GasPrice.created_at))
+            
+            result = await session.execute(query)
+            prices = result.scalars().all()
+            
+            # Organizar por tipo de combustible
+            current_prices = {}
+            for price in prices:
+                if price.fuel_type not in current_prices:
+                    current_prices[price.fuel_type] = {
+                        "price": price.price,
+                        "source": price.source,
+                        "confidence": price.confidence_score,
+                        "updated_at": price.created_at.isoformat(),
+                        "age_hours": price.calculate_age_hours(),
+                        "is_fresh": price.is_fresh()
                     }
             
-            # Construir resultado final
-            result_stations = []
-            for row in stations_data:
-                station_id = str(row[0])
-                
-                station_dict = {
-                    'id': station_id,
-                    'name': row[1],
-                    'brand': row[2],
-                    'address': row[3],
-                    'city': row[4],
-                    'state': row[5],
-                    'latitude': float(row[6]) if row[6] else None,
-                    'longitude': float(row[7]) if row[7] else None,
-                    'services': {
-                        'magna': bool(row[8]),
-                        'premium': bool(row[9]),
-                        'diesel': bool(row[10])
-                    },
-                    'stats': {
-                        'average_rating': float(row[11]) if row[11] else 0.0,
-                        'total_reviews': int(row[12]) if row[12] else 0
-                    },
-                    'current_prices': prices_by_station.get(station_id, {})
-                }
-                
-                # Calcular distancia si hay coordenadas
-                if latitude and longitude and station_dict['latitude'] and station_dict['longitude']:
-                    station_dict['distance_km'] = self._calculate_distance(
-                        latitude, longitude,
-                        station_dict['latitude'], station_dict['longitude']
-                    )
-                
-                result_stations.append(station_dict)
-            
-            return result_stations
-    
-    def _calculate_distance(self, lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-        """Cálculo rápido de distancia usando fórmula haversine simplificada"""
-        from math import sin, cos, sqrt, atan2, radians
-        
-        R = 6371.0  # Radio de la Tierra en km
-        lat1, lng1, lat2, lng2 = map(radians, [lat1, lng1, lat2, lng2])
-        
-        dlat = lat2 - lat1
-        dlng = lng2 - lng1
-        
-        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
-        c = 2 * atan2(sqrt(a), sqrt(1 - a))
-        
-        return round(R * c, 2)
-    
-    async def get_gas_station_by_id(self, station_id: str) -> Optional[Dict]:
-        """OPTIMIZADA: Obtiene una gasolinera por ID usando SQL directo"""
-        async with async_session() as session:
-            query = """
-                SELECT 
-                    gs.id, gs.name, gs.brand, gs.address, gs.city, gs.state,
-                    gs.latitude, gs.longitude, gs.has_magna, gs.has_premium, 
-                    gs.has_diesel, gs.average_rating, gs.total_reviews,
-                    gs.phone, gs.website
-                FROM gas_stations gs
-                WHERE gs.id = :station_id AND gs.is_active = true
-            """
-            
-            result = await session.execute(text(query), {'station_id': station_id})
-            station_row = result.first()
-            
-            if not station_row:
-                return None
-            
-            # Obtener precios actuales
-            prices_query = """
-                SELECT fuel_type, price, source, confidence_score, created_at
-                FROM gas_prices
-                WHERE gas_station_id = :station_id 
-                AND is_current = true 
-                AND validation_status = 'validated'
-            """
-            
-            prices_result = await session.execute(
-                text(prices_query), 
-                {'station_id': station_id}
-            )
-            
-            current_prices = {}
-            for fuel_type, price, source, confidence, created_at in prices_result.fetchall():
-                current_prices[fuel_type] = {
-                    'price': float(price),
-                    'source': source,
-                    'confidence': float(confidence),
-                    'updated_at': created_at.isoformat(),
-                    'age_hours': (datetime.utcnow() - created_at).total_seconds() / 3600
-                }
-            
-            return {
-                'id': str(station_row[0]),
-                'name': station_row[1],
-                'brand': station_row[2],
-                'address': station_row[3],
-                'city': station_row[4],
-                'state': station_row[5],
-                'latitude': float(station_row[6]) if station_row[6] else None,
-                'longitude': float(station_row[7]) if station_row[7] else None,
-                'services': {
-                    'magna': bool(station_row[8]),
-                    'premium': bool(station_row[9]),
-                    'diesel': bool(station_row[10])
-                },
-                'stats': {
-                    'average_rating': float(station_row[11]) if station_row[11] else 0.0,
-                    'total_reviews': int(station_row[12]) if station_row[12] else 0
-                },
-                'contact': {
-                    'phone': station_row[13],
-                    'website': station_row[14]
-                },
-                'current_prices': current_prices
-            }
+            return current_prices
     
     async def get_current_prices_all_stations(self, 
                                             fuel_type: Optional[str] = None,
                                             city: Optional[str] = None,
                                             state: Optional[str] = None,
                                             limit: int = 100) -> List[Dict]:
-        """OPTIMIZADA: Obtiene precios actuales usando SQL directo"""
-        async with async_session() as session:
-            query = """
-                SELECT 
-                    gs.id as gas_station_id,
-                    gs.name as gas_station_name,
-                    gs.address as gas_station_address,
-                    gs.brand as gas_station_brand,
-                    gs.city, gs.state, gs.latitude, gs.longitude,
-                    gp.fuel_type, gp.price, gp.source, 
-                    gp.confidence_score, gp.created_at
-                FROM gas_stations gs
-                JOIN gas_prices gp ON gs.id = gp.gas_station_id
-                WHERE gs.is_active = true 
-                AND gp.is_current = true 
-                AND gp.validation_status = 'validated'
-            """
-            
-            params = {}
-            conditions = []
+        """Obtiene precios actuales de múltiples gasolineras"""
+        async with async_session() as session:  # CORREGIDO
+            query = select(GasPrice, GasStation).join(
+                GasStation, GasPrice.gas_station_id == GasStation.id
+            ).where(
+                and_(
+                    GasPrice.is_current == True,
+                    GasPrice.validation_status == "validated",
+                    GasStation.is_active == True
+                )
+            )
             
             if fuel_type:
-                conditions.append("gp.fuel_type = :fuel_type")
-                params['fuel_type'] = fuel_type.lower()
+                query = query.where(GasPrice.fuel_type == fuel_type.lower())
             
             if city:
-                conditions.append("gs.city ILIKE :city")
-                params['city'] = f"%{city}%"
+                query = query.where(GasStation.city.ilike(f"%{city}%"))
             
             if state:
-                conditions.append("gs.state ILIKE :state")
-                params['state'] = f"%{state}%"
+                query = query.where(GasStation.state.ilike(f"%{state}%"))
             
-            if conditions:
-                query += " AND " + " AND ".join(conditions)
+            query = query.order_by(GasPrice.price.asc()).limit(limit)
             
-            query += " ORDER BY gp.price ASC LIMIT :limit"
-            params['limit'] = limit
-            
-            result = await session.execute(text(query), params)
+            result = await session.execute(query)
+            rows = result.all()
             
             prices_data = []
-            for row in result.fetchall():
-                age_hours = (datetime.utcnow() - row[11]).total_seconds() / 3600
-                
+            for price, station in rows:
                 prices_data.append({
-                    "gas_station_id": str(row[0]),
-                    "gas_station_name": row[1],
-                    "gas_station_address": row[2],
-                    "gas_station_brand": row[3],
-                    "fuel_type": row[8],
-                    "price": float(row[9]),
-                    "source": row[10],
-                    "confidence": float(row[11]) if row[11] else 1.0,
-                    "updated_at": row[12].isoformat() if row[12] else None,
-                    "age_hours": age_hours,
+                    "gas_station_id": station.id,
+                    "gas_station_name": station.name,
+                    "gas_station_address": station.address,
+                    "gas_station_brand": station.brand,
+                    "fuel_type": price.fuel_type,
+                    "price": price.price,
+                    "source": price.source,
+                    "confidence": price.confidence_score,
+                    "updated_at": price.created_at.isoformat(),
+                    "age_hours": price.calculate_age_hours(),
                     "location": {
-                        "latitude": float(row[6]) if row[6] else None,
-                        "longitude": float(row[7]) if row[7] else None,
-                        "city": row[4],
-                        "state": row[5]
+                        "latitude": station.latitude,
+                        "longitude": station.longitude,
+                        "city": station.city,
+                        "state": station.state
                     }
                 })
             
             return prices_data
     
-    # Mantener los métodos originales para create_price_report, create_review, etc.
-    # (copiar del archivo original ya que no necesitan optimización)
-    
     async def create_price_report(self, report_data: dict, request_ip: str) -> UserPriceReport:
-        """Crea un nuevo reporte de precio (sin cambios)"""
-        async with async_session() as session:
+        """Crea un nuevo reporte de precio"""
+        async with async_session() as session:  # CORREGIDO
+            # Crear el reporte
             report = UserPriceReport.create_from_form_data(
                 report_data, 
                 {"ip": request_ip}
             )
             
             session.add(report)
-            await session.flush()
+            await session.flush()  # Para obtener el ID
             
+            # Crear precio oficial inmediatamente
             price = GasPrice.create_from_user_report(
                 gas_station_id=report.gas_station_id,
                 fuel_type=report.fuel_type,
@@ -381,37 +206,103 @@ class DatabaseService:
             )
             
             session.add(price)
+            
+            # Marcar reporte como procesado
             report.process_report()
+            
+            # Actualizar estadísticas de la gasolinera
+            station_query = select(GasStation).where(GasStation.id == report.gas_station_id)
+            station_result = await session.execute(station_query)
+            station = station_result.scalar_one_or_none()
+            
+            if station:
+                station.total_reports += 1
+                station.last_price_update = datetime.utcnow()
             
             await session.commit()
             await session.refresh(report)
             
-            logger.info(f"Created price report: {report.id}")
+            logger.info(f"Created price report: {report.id} -> Price: {price.id}")
             return report
     
+    async def create_review(self, review_data: dict, request_ip: str) -> GasStationReview:
+        """Crea una nueva reseña"""
+        async with async_session() as session:  # CORREGIDO
+            # Crear la reseña
+            review = GasStationReview.create_from_form_data(
+                review_data,
+                {"ip": request_ip}
+            )
+            
+            session.add(review)
+            await session.flush()
+            
+            # Actualizar estadísticas de la gasolinera
+            station_query = select(GasStation).where(GasStation.id == review.gas_station_id)
+            station_result = await session.execute(station_query)
+            station = station_result.scalar_one_or_none()
+            
+            if station:
+                # Recalcular rating promedio
+                if station.total_reviews == 0:
+                    station.average_rating = review.rating
+                else:
+                    total_points = (station.average_rating * station.total_reviews) + review.rating
+                    station.average_rating = total_points / (station.total_reviews + 1)
+                
+                station.total_reviews += 1
+            
+            await session.commit()
+            await session.refresh(review)
+            
+            logger.info(f"Created review: {review.id}")
+            return review
+    
+    async def get_reviews(self, 
+                         station_id: Optional[str] = None,
+                         limit: int = 20,
+                         offset: int = 0) -> List[GasStationReview]:
+        """Obtiene reseñas"""
+        async with async_session() as session:  # CORREGIDO
+            query = select(GasStationReview).where(
+                GasStationReview.status == "approved"
+            )
+            
+            if station_id:
+                query = query.where(GasStationReview.gas_station_id == station_id)
+            
+            query = query.order_by(desc(GasStationReview.created_at))
+            query = query.offset(offset).limit(limit)
+            
+            result = await session.execute(query)
+            return result.scalars().all()
+    
     async def get_price_statistics(self, fuel_type: str, region: Optional[str] = None) -> Dict:
-        """OPTIMIZADA: Estadísticas de precios usando SQL directo"""
-        async with async_session() as session:
+        """Obtiene estadísticas de precios"""
+        async with async_session() as session:  # CORREGIDO
+            # Obtener precios recientes
             cutoff_date = datetime.utcnow() - timedelta(days=7)
             
-            query = """
-                SELECT gp.price
-                FROM gas_prices gp
-                JOIN gas_stations gs ON gp.gas_station_id = gs.id
-                WHERE gp.fuel_type = :fuel_type
-                AND gp.created_at >= :cutoff_date
-                AND gp.is_current = true
-                AND gp.validation_status = 'validated'
-            """
+            query = select(GasPrice.price).where(
+                and_(
+                    GasPrice.fuel_type == fuel_type.lower(),
+                    GasPrice.created_at >= cutoff_date,
+                    GasPrice.is_current == True,
+                    GasPrice.validation_status == "validated"
+                )
+            )
             
-            params = {'fuel_type': fuel_type.lower(), 'cutoff_date': cutoff_date}
-            
+            # Filtrar por región si se especifica
             if region:
-                query += " AND (gs.state ILIKE :region OR gs.city ILIKE :region)"
-                params['region'] = f"%{region}%"
+                query = query.join(GasStation).where(
+                    or_(
+                        GasStation.state.ilike(f"%{region}%"),
+                        GasStation.city.ilike(f"%{region}%")
+                    )
+                )
             
-            result = await session.execute(text(query), params)
-            prices = [float(row[0]) for row in result.fetchall()]
+            result = await session.execute(query)
+            prices = [row[0] for row in result.fetchall()]
             
             if not prices:
                 return {"error": "No hay datos de precios disponibles"}
@@ -425,6 +316,61 @@ class DatabaseService:
                 "maximum": max(prices),
                 "range": round(max(prices) - min(prices), 2)
             }
+    
+    async def search_stations_by_region(self, region: str, fuel_type: str, limit: int = 20) -> List[Dict]:
+        """Busca estaciones más baratas por región"""
+        async with async_session() as session:  # CORREGIDO
+            # Buscar gasolineras en la región
+            query = select(GasStation).where(
+                and_(
+                    GasStation.is_active == True,
+                    or_(
+                        GasStation.city.ilike(f"%{region}%"),
+                        GasStation.state.ilike(f"%{region}%")
+                    )
+                )
+            )
+            
+            result = await session.execute(query)
+            stations = result.scalars().all()
+            
+            if not stations:
+                return []
+            
+            # Obtener precios de estas estaciones
+            station_ids = [s.id for s in stations]
+            
+            price_query = select(GasPrice, GasStation).join(
+                GasStation, GasPrice.gas_station_id == GasStation.id
+            ).where(
+                and_(
+                    GasPrice.gas_station_id.in_(station_ids),
+                    GasPrice.fuel_type == fuel_type.lower(),
+                    GasPrice.is_current == True,
+                    GasPrice.validation_status == "validated"
+                )
+            ).order_by(GasPrice.price.asc()).limit(limit)
+            
+            price_result = await session.execute(price_query)
+            price_rows = price_result.all()
+            
+            stations_with_prices = []
+            for price, station in price_rows:
+                stations_with_prices.append({
+                    "gas_station_id": station.id,
+                    "name": station.name,
+                    "brand": station.brand,
+                    "address": station.address,
+                    "latitude": station.latitude,
+                    "longitude": station.longitude,
+                    "price": price.price,
+                    "source": price.source,
+                    "confidence": price.confidence_score,
+                    "updated_at": price.created_at.isoformat(),
+                    "age_hours": price.calculate_age_hours()
+                })
+            
+            return stations_with_prices
 
 
 # Instancia global del servicio
